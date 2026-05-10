@@ -1,8 +1,8 @@
-# <APP_TITLE>
+# Facility Layout
 
-<APP_TAGLINE>
+Plant facility layout via GDP — minimize facility size + pipe costs
 
-**Live demo:** https://<APP_SLUG>.griffith-pse.com  
+**Live demo:** https://facility-layout.griffith-pse.com  
 **Home:** https://griffith-pse.com
 
 ## Run locally

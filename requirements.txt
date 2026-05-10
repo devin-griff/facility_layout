@@ -1,1 +1,21 @@
-streamlit~=1.30
+# Two-tier pinning strategy:
+#
+# Tier 1 — exact pin. The Pyomo APIs we use for the time-limit incumbent
+# path (load_solutions=False; results.found_feasible_solution();
+# m.solutions.load_from(results)) have shifted across minor releases.
+# A hard pin guarantees the Fly image rebuilds with identical solver
+# behavior every time. Bump deliberately + test before deploy.
+pyomo==6.8.2
+highspy==1.14.0
+#
+# Tier 2 — compatible release. Stable surface APIs at our usage level
+# (sliders, data_editor, charts), so accept patch upgrades for security
+# and bug fixes.
+streamlit~=1.52.0
+pandas~=3.0.0
+altair~=5.0.0
+#
+# Pandas Styler dependency. Pandas 3.x demands jinja2>=3.1.5 for `.style`
+# and `st.dataframe`'s default rendering path can trip the version-mismatch
+# check. Pin to keep that out of the failure modes.
+jinja2~=3.1.5
