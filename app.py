@@ -12,8 +12,10 @@
 #                  top-to-bottom; persistent values live in `st.session_state`.
 #   - pyomo      — algebraic modeling, including the `pyomo.gdp` submodule
 #                  for native Disjunction blocks.
-#   - HiGHS      — MIP solver, called via Pyomo's `appsi_highs` interface.
-#                  Ships as a pip wheel (`highspy`) — no system install.
+#   - Gurobi     — MIP solver, called via Pyomo's native appsi Gurobi
+#                  interface. Ships as a pip wheel (`gurobipy`); needs a
+#                  Gurobi license (WLS in production via Fly secrets, or a
+#                  local license file pointed to by GRB_LICENSE_FILE).
 #   - pandas     — DataFrames for the editable block-dimensions and
 #                  cost-matrix tables.
 #   - altair     — interactive layout figure (rectangles + pipe lines +
@@ -24,7 +26,11 @@
 #   pair (i is left / right / above / below j); rotation (when enabled) is
 #   a 2-way disjunction per block (default vs. 90° rotated). Both are
 #   written as `pyomo.gdp.Disjunction` blocks and reformulated to a MILP
-#   via the multi-Big-M transformation (`gdp.mbigm`), then solved with HiGHS.
+#   via the Big-M GDP transformation, then solved with Gurobi. Pipe
+#   distances are computed by always-on dx/dy constraints, kept OUT of the
+#   disjunction so the objective never depends on which spatial relation is
+#   chosen — this avoids the costly continuous degeneracy that coupling
+#   distance into the disjuncts would create.
 #
 # Symmetry breaking:
 #   `sym=1` is hardcoded. The trivial mirror symmetries make the LP
@@ -41,7 +47,7 @@
 # File roadmap (matching section banners below):
 #   1. Page config + CSS + home-logo.
 #   2. Constants and defaults.
-#   3. State helpers — session_state init, scenario generators, resets.
+#   3. State helpers — object-list model, add/delete, reset, randomize.
 #   4. Solver — build_model + log-capturing solve + incumbent loader.
 #   5. Visualization — Altair layout figure with rectangles + pipe overlay.
 #   6. Tab renderers — Layout, Data, Formulation, Logs.
@@ -49,8 +55,11 @@
 # =============================================================================
 
 import base64
+import contextlib
 import io
+import os
 import random
+import time
 from pathlib import Path
 
 import altair as alt
@@ -58,9 +67,37 @@ import pandas as pd
 import pyomo.environ as pyo
 import streamlit as st
 from pyomo.common.errors import ApplicationError
-from pyomo.common.tee import capture_output
 from pyomo.gdp import Disjunction
 from pyomo.opt import TerminationCondition
+
+
+def _materialize_gurobi_license():
+    """Production license shim. Fly secrets surface as environment
+    variables, but gurobipy wants a license FILE — so if the three WLS
+    values are present and no license file is configured, write one to
+    the home directory and point GRB_LICENSE_FILE at it. Local dev is
+    untouched: there GRB_LICENSE_FILE already points at a file on disk.
+    The values never enter the repo or image — only Fly's secret store
+    and the container's private filesystem."""
+    if os.environ.get("GRB_LICENSE_FILE"):
+        return
+    access = os.environ.get("GRB_WLSACCESSID")
+    secret = os.environ.get("GRB_WLSSECRET")
+    license_id = os.environ.get("GRB_LICENSEID")
+    if not (access and secret and license_id):
+        return
+    lic_path = Path.home() / "gurobi.lic"
+    if not lic_path.exists():
+        lic_path.write_text(
+            f"WLSACCESSID={access}\n"
+            f"WLSSECRET={secret}\n"
+            f"LICENSEID={license_id}\n",
+            encoding="utf-8",
+        )
+    os.environ["GRB_LICENSE_FILE"] = str(lic_path)
+
+
+_materialize_gurobi_license()
 
 
 # ── 1. Page config + CSS + home-logo ──────────────────────────────────────────
@@ -69,137 +106,182 @@ st.set_page_config(
     page_title="Facility Layout",
     page_icon="favicon.png",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# Sidebar pattern (quad-tank style): home-logo lives at the top of the sidebar
-# in normal flow, and Streamlit's sticky `stSidebarHeader` is hidden so the
-# logo sits flush at the top. See griffith-pse-app-template SETUP.md "Sidebar
-# vs. no sidebar" for the rationale.
-st.markdown("""
-<style>
-section[data-testid="stSidebar"] {
-    user-select: none;
-    -webkit-user-select: none;
-}
-.home-logo-corner {
-    display: block;
-    margin: 0 0 0.75rem;
-}
-.home-logo-corner img {
-    width: 32px;
-    height: 32px;
-    border-radius: 4px;
-    display: block;
-}
-[data-testid="stSidebarHeader"] {
-    display: none !important;
-}
-[data-testid="stSidebarUserContent"] {
-    padding-top: 0.5rem !important;
-}
-[data-testid="stMainBlockContainer"] {
-    padding-top: 2.5rem !important;
-    padding-bottom: 0rem !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
+# Fixed-corner home logo (no sidebar — all controls are inline on the
+# Optimizer tab). Same pattern as strip-packing / diet / knapsack.
 _FAVICON_DATA_URL = "data:image/png;base64," + base64.b64encode(
     (Path(__file__).parent / "favicon.png").read_bytes()
 ).decode()
-_HOME_LOGO_HTML = (
-    '<a class="home-logo-corner" href="https://griffith-pse.com" target="_self">'
+st.markdown(
+    """
+    <style>
+    .home-logo-corner {
+        position: fixed;
+        top: 0.5rem;
+        left: 0.75rem;
+        z-index: 999999;
+    }
+    .home-logo-corner img {
+        width: 32px;
+        height: 32px;
+        border-radius: 4px;
+        display: block;
+    }
+    .block-container,
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 2.5rem !important;
+    }
+    </style>
+    """
+    f'<a href="https://griffith-pse.com" target="_self" '
+    f'class="home-logo-corner">'
     f'<img src="{_FAVICON_DATA_URL}" alt="Griffith PSE — home" />'
-    '</a>'
+    f"</a>",
+    unsafe_allow_html=True,
 )
-st.sidebar.markdown(_HOME_LOGO_HTML, unsafe_allow_html=True)
 
 
 # ── 2. Constants and defaults ─────────────────────────────────────────────────
 
-N_MIN = 2
-N_MAX = 10
-N_DEFAULT = 6
+MAX_OBJECTS = 25           # rack + up to 24 others (default instance stays 15)
+MIN_OBJECTS = 2            # rack + ≥1 object (sym_1/sym_2 reference block 2)
 
-# Block-dimension cap — random scenarios draw from {1, 2, 3}. Editable in the
-# Data tab without an upper bound enforced (the bigger you go, the harder the
-# solve gets).
-DIM_MAX_RAND = 3
+DIM_MIN, DIM_MAX = 1, 9    # editable length / width range
+DIM_RAND_MAX = 3           # Randomize draws dimensions from [1, 3]
+COST_MIN, COST_MAX = 0, 9  # editable pipe-cost-to-rack range
+COST_RAND_MAX = 3          # Randomize draws costs from [1, 3]
 
-# Cost-matrix range for the "Random pipes" scenario.
-COST_MAX_RAND = 10
+# The rack (object 1) spans the facility length: fixed long-and-thin dims, and
+# always the longest object so every instance stays feasible. Reset and
+# Randomize both keep these — only the other objects' dims/costs change.
+RACK_LEN, RACK_WID = 9, 1
+DEFAULT_N = 15             # objects present on first load / after Reset
 
-# Solve time limit slider range (seconds).
-TIMELIMIT_MIN = 5
-TIMELIMIT_MAX = 30
-TIMELIMIT_DEFAULT = 10
+# Minimum separation distance (integer stepper, like strip-packing's width).
+D_MIN, D_MAX, D_DEFAULT = 0, 3, 1
 
-# RNG seed used by the scenario generators. Fixing it keeps the same instance
-# across reruns until the user clicks "Initialize at defaults" (which bumps
-# the seed).
+# Time-limit presets for the inline radio (label → seconds).
+_TIME_LIMITS = {"10 s": 10, "30 s": 30, "60 s": 60}
+
+# RNG seed for Randomize; bumped each click for a fresh instance.
 DEFAULT_SEED = 1
+
+# Categorical palette — each object's index drives BOTH its editor badge color
+# and its block fill in the layout, so the two views stay visually linked
+# (object 1, the rack, gets the first color). Same palette as strip-packing.
+_PALETTE = [
+    "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B",
+    "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC", "#1F77B4", "#9467BD",
+]
 
 
 # ── 3. State helpers ──────────────────────────────────────────────────────────
+#
+# The instance is an ordered list of objects. objs[0] is the rack (object 1):
+# every other object has a single pipe cost to the rack, and objects don't
+# connect to each other. Objects carry stable integer ids so per-row editor
+# widgets keep their state across add/delete; length/width/cost map id → value
+# (the rack's cost entry is unused).
 
-def _generate_scenario(n, scenario, seed):
-    """Build (l0_dict, w0_dict, c_matrix, d_default) for the chosen scenario.
-
-    Returns:
-        l0:  {i: length}     for i in 1..n
-        w0:  {i: width}      for i in 1..n
-        cmat: list of lists, n×n, lower-triangular (cmat[i-1][j-1] for i > j),
-              upper-triangular and diagonal are 0. Returned as a pandas-friendly
-              shape so the data editor can show it directly.
-    """
+def _gen_objects(seed, objs):
+    """Roll dimensions and pipe costs for the NON-rack objects, leaving the
+    rack (first object) pinned at its fixed RACK_LEN×RACK_WID. Used by both the
+    default instance and Randomize, so neither ever resizes the rack."""
     rng = random.Random(seed)
-    l0 = {i: rng.randint(1, DIM_MAX_RAND) for i in range(1, n + 1)}
-    w0 = {i: rng.randint(1, DIM_MAX_RAND) for i in range(1, n + 1)}
-    cmat = [[0.0] * n for _ in range(n)]
-    if scenario == "Central rack":
-        # Block 1 is the rack; every other block has unit cost to it, zero
-        # cost between non-rack blocks.
-        for i in range(2, n + 1):
-            cmat[i - 1][0] = 1.0
-    elif scenario == "Random pipes":
-        for i in range(2, n + 1):
-            for j in range(1, i):
-                cmat[i - 1][j - 1] = float(rng.randint(1, COST_MAX_RAND))
-    # "Custom" — leave at zeros; user fills in.
-    return l0, w0, cmat
+    objs = list(objs)
+    rack_id = objs[0]
+    length = {rack_id: RACK_LEN}
+    width = {rack_id: RACK_WID}
+    cost = {rack_id: 0}
+    for oid in objs[1:]:
+        length[oid] = rng.randint(DIM_MIN, DIM_RAND_MAX)
+        width[oid] = rng.randint(DIM_MIN, DIM_RAND_MAX)
+        cost[oid] = rng.randint(1, COST_RAND_MAX)
+    return objs, length, width, cost
+
+
+def _default_data():
+    """Initial / Reset instance: the rack plus DEFAULT_N-1 small objects."""
+    return _gen_objects(DEFAULT_SEED, list(range(1, DEFAULT_N + 1)))
+
+
+def _randomize_data(seed, objs):
+    """Re-roll only the non-rack objects, preserving the current object count
+    and row ids; the rack keeps its fixed dimensions."""
+    return _gen_objects(seed, objs)
+
+
+def _block_label(i):
+    """Display name for block index i: the rack (object 1) reads 'rack', and
+    every other object is renumbered from 1 (so block 2 → '1', block 3 → '2')."""
+    return "rack" if int(i) == 1 else str(int(i) - 1)
+
+
+def _set_data(objs, length, width, cost):
+    ss = st.session_state
+    ss["objs"], ss["length"], ss["width"], ss["cost"] = (
+        list(objs), dict(length), dict(width), dict(cost)
+    )
 
 
 def _init_state():
     ss = st.session_state
-    ss.setdefault("n", N_DEFAULT)
     ss.setdefault("rotate", False)
-    ss.setdefault("scenario", "Central rack")
-    ss.setdefault("d_min", 1.0)
+    ss.setdefault("d_min", D_DEFAULT)
     ss.setdefault("seed", DEFAULT_SEED)
-    if "l0" not in ss or "w0" not in ss or "cmat" not in ss:
-        l0, w0, cmat = _generate_scenario(ss["n"], ss["scenario"], ss["seed"])
-        ss["l0"] = l0
-        ss["w0"] = w0
-        ss["cmat"] = cmat
+    ss.setdefault("_obj_ver", 0)
+    if "objs" not in ss:
+        _set_data(*_default_data())
+    # Reset / Randomize set a one-shot flag and rerun; we apply it here, before
+    # any editor widget is instantiated, so widget-backed keys don't clash.
+    if ss.pop("_pending_reset", False):
+        _set_data(*_default_data())
+        ss["_obj_ver"] += 1
+        ss.pop("res", None)
+    if ss.pop("_pending_random", False):
+        ss["seed"] += 1
+        _set_data(*_randomize_data(ss["seed"], ss["objs"]))
+        ss["_obj_ver"] += 1
+        ss.pop("res", None)
 
 
-def _resync_for_n_or_scenario():
-    """Called when the user changes n or the scenario radio. Regenerates the
-    block dims and cost matrix to a fresh instance for the new shape."""
+def add_object():
     ss = st.session_state
-    l0, w0, cmat = _generate_scenario(ss["n"], ss["scenario"], ss["seed"])
-    ss["l0"] = l0
-    ss["w0"] = w0
-    ss["cmat"] = cmat
+    if len(ss["objs"]) >= MAX_OBJECTS:
+        return
+    new_id = (max(ss["objs"]) + 1) if ss["objs"] else 1
+    ss["objs"] = ss["objs"] + [new_id]
+    ss["length"] = {**ss["length"], new_id: 2}
+    ss["width"] = {**ss["width"], new_id: 2}
+    ss["cost"] = {**ss["cost"], new_id: 1}
+    ss.pop("res", None)
 
 
-def _initialize_at_defaults():
-    """`on_click` for the sidebar reset button. Bumps the seed so the user
-    gets a *different* random instance, then regenerates the scenario."""
-    st.session_state["seed"] += 1
-    _resync_for_n_or_scenario()
-    st.session_state.pop("res", None)
+def _delete_object(oid):
+    """on_click for a per-row delete button. The rack (first object) can't be
+    deleted, nor can the list drop below MIN_OBJECTS."""
+    ss = st.session_state
+    if oid == ss["objs"][0] or len(ss["objs"]) <= MIN_OBJECTS:
+        return
+    ss["objs"] = [i for i in ss["objs"] if i != oid]
+    for key in ("length", "width", "cost"):
+        ss[key] = {i: v for i, v in ss[key].items() if i != oid}
+    ss.pop("res", None)
+
+
+def _objs_to_inputs(ss):
+    """Map the object list onto build_model's (n, l0, w0, cmat). The cost
+    matrix is a star: object at display position p (≥2) gets its cost-to-rack
+    in cmat[p-1][0]; everything else is zero."""
+    objs = ss["objs"]
+    n = len(objs)
+    l0 = {p: int(ss["length"][objs[p - 1]]) for p in range(1, n + 1)}
+    w0 = {p: int(ss["width"][objs[p - 1]]) for p in range(1, n + 1)}
+    cmat = [[0.0] * n for _ in range(n)]
+    for p in range(2, n + 1):
+        cmat[p - 1][0] = float(ss["cost"][objs[p - 1]])
+    return n, l0, w0, cmat
 
 
 # ── 4. Solver ─────────────────────────────────────────────────────────────────
@@ -245,76 +327,103 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
     m.y = pyo.Var(m.n, bounds=(0, m.UB))      # lower-left y
     m.l = pyo.Var(m.n, bounds=(0, m.UB))      # block length (= l0 unless rotated)
     m.w = pyo.Var(m.n, bounds=(0, m.UB))      # block width  (= w0 unless rotated)
-    m.t = pyo.Var(m.p, bounds=(0, m.UB))      # x-axis Manhattan separation
-    m.s = pyo.Var(m.p, bounds=(0, m.UB))      # y-axis Manhattan separation
+    m.dx = pyo.Var(m.p, bounds=(0, m.UB))     # x-axis (horizontal) edge gap
+    m.dy = pyo.Var(m.p, bounds=(0, m.UB))     # y-axis (vertical) edge gap
     m.l_f = pyo.Var(within=pyo.NonNegativeReals)  # facility length
     m.w_f = pyo.Var(within=pyo.NonNegativeReals)  # facility width
 
     # Facility bounds: every block lies inside the facility's bounding box.
+    # Length is the vertical (y) axis; width the horizontal (x) axis.
     @m.Constraint(m.n)
     def facility_length(m, i):
-        return m.l_f >= m.x[i] + m.l[i]
+        return m.l_f >= m.y[i] + m.l[i]
 
     @m.Constraint(m.n)
     def facility_width(m, i):
-        return m.w_f >= m.y[i] + m.w[i]
+        return m.w_f >= m.x[i] + m.w[i]
 
-    # Minimum separation: t_ij must be at least the user-set min distance.
-    # Note: this only enforces the ACTIVE-disjunct axis (whichever of the
-    # four left/right/above/below is selected), so the bound is conservative.
+    # Pipe rack (block 1) spans the facility length (the vertical y-axis):
+    # pinned at y=0 with the facility length fixed to the rack's length. Every
+    # other object then fits within [0, l_1] in y and sits to the LEFT or RIGHT
+    # of the rack (in x). The rack's x is free; only the WIDTH (horizontal x)
+    # is minimized.
+    m.rack_at_origin = pyo.Constraint(expr=m.y[1] == 0)
+    m.facility_len_eq_rack = pyo.Constraint(expr=m.l_f == m.l[1])
+
+    # Rectilinear edge gaps, defined GLOBALLY (not inside the disjunction):
+    # dx_ij is the horizontal (x/width-axis) clearance between blocks i and j
+    # (0 when they overlap in x), dy_ij the vertical (y/length-axis). They're
+    # minimized in the objective, so each settles to the true gap. Keeping them
+    # out of the disjuncts makes the objective independent of which spatial
+    # relation is chosen — the disjunction below decides only non-overlap.
     @m.Constraint(m.p)
-    def min_dist(m, i, j):
-        return m.t[i, j] >= m.d[i, j]
+    def dx_lb_a(m, i, j):
+        return m.dx[i, j] >= m.x[i] - (m.x[j] + m.w[j])
+
+    @m.Constraint(m.p)
+    def dx_lb_b(m, i, j):
+        return m.dx[i, j] >= m.x[j] - (m.x[i] + m.w[i])
+
+    @m.Constraint(m.p)
+    def dy_lb_a(m, i, j):
+        return m.dy[i, j] >= m.y[i] - (m.y[j] + m.l[j])
+
+    @m.Constraint(m.p)
+    def dy_lb_b(m, i, j):
+        return m.dy[i, j] >= m.y[j] - (m.y[i] + m.l[i])
 
     # Symmetry breaking: anchor block 1 left-of-and-below block 2's center.
     # Kills 4 of 8 trivial reflective symmetries; halves the search space.
     if sym == 1:
         @m.Constraint()
         def sym_1(m):
-            return m.x[1] + m.l[1] / 2 <= m.x[2] + m.l[2] / 2
+            return m.x[1] + m.w[1] / 2 <= m.x[2] + m.w[2] / 2
 
         @m.Constraint()
         def sym_2(m):
-            return m.y[1] + m.w[1] / 2 <= m.y[2] + m.w[2] / 2
+            return m.y[1] + m.l[1] / 2 <= m.y[2] + m.l[2] / 2
 
     # Objective: minimize facility size + Σ pipe-weighted Manhattan distances.
     m.obj = pyo.Objective(
         expr=m.l_f + m.w_f
-             + sum(m.c[i, j] * (m.t[i, j] + m.s[i, j]) for i, j in m.p),
+             + sum(m.c[i, j] * (m.dx[i, j] + m.dy[i, j]) for i, j in m.p),
         sense=pyo.minimize,
     )
 
-    # Non-overlap GDP: 4-way disjunction per pair. Each disjunct fixes the
-    # spatial relationship and connects (t, s) to the active separation.
+    # Non-overlap GDP: 4-way disjunction per pair. Each disjunct is a single
+    # inequality forcing one spatial relation with the minimum separation d
+    # baked in. Distance is handled by the global dx/dy constraints above, so
+    # these decide only feasibility (which pairs are separated, on which
+    # axis) — never the objective.
     @m.Disjunction(m.p)
     def no_overlap(m, i, j):
         return [
-            # i is left of j
-            [m.x[j] - (m.x[i] + m.l[i]) == m.t[i, j],
-             m.y[i] - (m.y[j] + m.w[j]) <= m.s[i, j],
-             m.y[j] - (m.y[i] + m.w[i]) <= m.s[i, j]],
-            # i is right of j
-            [m.x[i] - (m.x[j] + m.l[j]) == m.t[i, j],
-             m.y[i] - (m.y[j] + m.w[j]) <= m.s[i, j],
-             m.y[j] - (m.y[i] + m.w[i]) <= m.s[i, j]],
-            # i is above j
-            [m.y[i] - (m.y[j] + m.w[j]) == m.t[i, j],
-             m.x[i] - (m.x[j] + m.l[j]) <= m.s[i, j],
-             m.x[j] - (m.x[i] + m.l[i]) <= m.s[i, j]],
-            # i is below j
-            [m.y[j] - (m.y[i] + m.w[i]) == m.t[i, j],
-             m.x[i] - (m.x[j] + m.l[j]) <= m.s[i, j],
-             m.x[j] - (m.x[i] + m.l[i]) <= m.s[i, j]],
+            [m.x[i] + m.w[i] + m.d[i, j] <= m.x[j]],   # i left of j
+            [m.x[j] + m.w[j] + m.d[i, j] <= m.x[i]],   # i right of j
+            [m.y[i] + m.l[i] + m.d[i, j] <= m.y[j]],   # i below j
+            [m.y[j] + m.l[j] + m.d[i, j] <= m.y[i]],   # i above j
         ]
 
-    # Rotation GDP (optional): 2-way disjunction per block.
+    # Rotation GDP (optional): 2-way disjunction per block — EXCEPT block 1
+    # (the rack), which keeps a fixed orientation even when rotation is on.
+    # Fixing the rack is optimum-preserving: it only canonicalizes the
+    # layout's overall orientation (the transpose symmetry), and every other
+    # block can still rotate to recover the transposed layout at the same
+    # objective. It also keeps the rack's footprint stable for the viewer.
     if rotate:
-        @m.Disjunction(m.n)
+        # Rotation disjunction over the non-rack blocks (2..n) only.
+        _rot_blocks = [i for i in m.n if i != 1]
+
+        @m.Disjunction(_rot_blocks)
         def rotation(m, i):
             return [
                 [m.l[i] == m.l0[i], m.w[i] == m.w0[i]],   # default
                 [m.l[i] == m.w0[i], m.w[i] == m.l0[i]],   # 90° rotated
             ]
+
+        # Block 1 (rack) is fixed in its default orientation regardless.
+        m.fix_rack_l = pyo.Constraint(expr=m.l[1] == m.l0[1])
+        m.fix_rack_w = pyo.Constraint(expr=m.w[1] == m.w0[1])
     else:
         @m.Constraint(m.n)
         def fix_l(m, i):
@@ -327,91 +436,114 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
     return m
 
 
-def _solve_capturing(m, time_limit):
-    """Run HiGHS with FD-level log capture. Returns (results, log_text).
+class _LicenseBusyError(RuntimeError):
+    """Raised when Gurobi's WLS checkout fails even after a retry —
+    typically the license's concurrent-session seats are all taken.
+    solve() maps this onto the `license_busy` status."""
 
-    Uses `load_solutions=False` so the caller can decide whether the result
-    is loadable based on `termination_condition` + `found_feasible_solution()`.
-    See app docstring for why.
-    """
-    log_text = ""
+
+def _run_gurobi(m, time_limit):
+    """Solve the (already GDP-transformed) MILP via the NATIVE appsi
+    Gurobi interface, loading the solution onto `m` when one exists.
+    Returns (termination_condition, primal, dual, log).
+
+    The native interface (not the legacy SolverFactory("appsi_gurobi"))
+    is required: the legacy wrapper's symbol-map bookkeeping crashes on
+    GDP-transformed models ('DisjunctData' has no attribute 'solutions').
+    Gurobi checks out a WLS seat when its environment starts; a checkout
+    collision gets one quiet retry, then surfaces as license_busy, and
+    the seat is always released afterward."""
+    from pyomo.contrib.appsi.solvers import Gurobi as AppsiGurobi
+
+    opt = AppsiGurobi()
+    opt.config.time_limit = float(time_limit)
+    opt.config.load_solution = False
+    opt.config.stream_solver = True  # log into the redirected stdout
+    buf = io.StringIO()
     try:
-        with capture_output(capture_fd=True) as buf:
-            solver = pyo.SolverFactory("appsi_highs")
-            results = solver.solve(m, tee=True,
-                                   timelimit=int(time_limit),
-                                   load_solutions=False)
-        log_text = buf.getvalue()
-    except TypeError:
-        # Older Pyomo without capture_fd.
-        with capture_output() as buf:
-            solver = pyo.SolverFactory("appsi_highs")
-            results = solver.solve(m, tee=True,
-                                   timelimit=int(time_limit),
-                                   load_solutions=False)
-        log_text = buf.getvalue()
-    return results, log_text
-
-
-def _has_feasible(results):
-    """Cross-version probe: did the solver find ANY feasible solution?
-    `appsi_highs`'s LegacySolverInterface exposes this slightly differently
-    across Pyomo releases. Try the documented hook first, fall back to
-    bound-finiteness check."""
-    fn = getattr(results, "found_feasible_solution", None)
-    if callable(fn):
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            for attempt in (1, 2):
+                try:
+                    res = opt.solve(m)
+                    break
+                except Exception as e:
+                    lowered = str(e).lower()
+                    if "license" in lowered or "wls" in lowered:
+                        if attempt == 1:
+                            time.sleep(2.0)
+                            continue
+                        raise _LicenseBusyError(str(e)) from e
+                    raise
+            if res.best_feasible_objective is not None:
+                res.solution_loader.load_vars()
+    finally:
         try:
-            return bool(fn())
+            opt.release_license()
         except Exception:
             pass
-    # Fallback: if the upper bound is finite, the solver has *some* feasible
-    # solution — incumbent loading should work.
-    try:
-        ub = results.problem[0].upper_bound
-        return ub is not None and ub != float("inf")
-    except Exception:
-        return False
+
+    # Scrub license-identifying lines before the log reaches the Logs tab
+    # (Gurobi's WLS banner prints the license ID and registrant).
+    log = "\n".join(
+        ln for ln in buf.getvalue().splitlines()
+        if not any(k in ln.lower()
+                   for k in ("wls", "registered to", "academic license"))
+    )
+    # Map the appsi TerminationCondition onto the legacy enum this module
+    # branches on; names match for the cases we handle, else `unknown`.
+    tc = getattr(
+        TerminationCondition, res.termination_condition.name,
+        TerminationCondition.unknown,
+    )
+    return tc, res.best_feasible_objective, res.best_objective_bound, log
 
 
 def solve(n, l0, w0, cmat, d_uniform, rotate, sym, time_limit):
     """Top-level entrypoint. Returns a plain dict the UI can stash in
     session_state without holding a live Pyomo model."""
 
+    t0 = time.time()
     m = build_model(n, l0, w0, cmat, d_uniform, rotate, sym)
-    pyo.TransformationFactory("gdp.mbigm").apply_to(m)
+    pyo.TransformationFactory("gdp.bigm").apply_to(m)
 
     try:
-        results, log = _solve_capturing(m, time_limit)
+        tc, primal, dual, log = _run_gurobi(m, time_limit)
+    except _LicenseBusyError:
+        return {
+            "status": "license_busy",
+            "message": (
+                "The Gurobi license is busy (it allows a limited number of "
+                "concurrent solves). Wait a few seconds and click Solve again."
+            ),
+            "log": "",
+        }
     except ApplicationError as e:
         return {
             "status": "solver_missing",
             "message": (
-                f"HiGHS solver not available. Run `pip install highspy`. ({e})"
+                f"Gurobi solver not available. Run `pip install gurobipy` and "
+                f"provide a license. ({e})"
             ),
             "log": "",
         }
 
-    tc = results.solver.termination_condition
-
-    # Status branch — load solutions only when there's something to load.
-    feasible = _has_feasible(results)
-    status = None
+    # Status branch. A feasible incumbent exists iff Gurobi returned a
+    # primal objective.
+    feasible = primal is not None
     if tc == TerminationCondition.optimal:
-        m.solutions.load_from(results)
         status = "optimal"
-    elif tc in (TerminationCondition.maxTimeLimit, TerminationCondition.userInterrupt):
-        if feasible:
-            m.solutions.load_from(results)
-            status = "incumbent"
-        else:
-            status = "no_feasible"
+    elif tc in (TerminationCondition.maxTimeLimit,
+                TerminationCondition.userInterrupt):
+        status = "incumbent" if feasible else "no_feasible"
     elif tc in (TerminationCondition.infeasible,
                 TerminationCondition.infeasibleOrUnbounded):
         status = "infeasible"
     elif tc == TerminationCondition.unbounded:
         status = "unbounded"
     else:
-        status = str(tc)
+        # Anything else (e.g. interrupted/unknown) still counts as an
+        # incumbent if a feasible solution was loaded.
+        status = "incumbent" if feasible else str(tc)
 
     if status not in ("optimal", "incumbent"):
         return {"status": status, "log": log}
@@ -433,20 +565,19 @@ def solve(n, l0, w0, cmat, d_uniform, rotate, sym, time_limit):
         pairs.append({
             "i": i, "j": j,
             "c": float(pyo.value(m.c[i, j])),
-            "t": float(pyo.value(m.t[i, j])),
-            "s": float(pyo.value(m.s[i, j])),
+            "dx": float(pyo.value(m.dx[i, j])),
+            "dy": float(pyo.value(m.dy[i, j])),
         })
 
     # Result-level summary numbers for the status banner.
     obj = float(pyo.value(m.obj))
     facility = (float(pyo.value(m.l_f)), float(pyo.value(m.w_f)))
-    pipe_cost = sum(p["c"] * (p["t"] + p["s"]) for p in pairs)
+    pipe_cost = sum(p["c"] * (p["dx"] + p["dy"]) for p in pairs)
 
-    # Best-known bound (for gap reporting on incumbent path).
-    try:
-        lower_bound = results.problem[0].lower_bound
-    except Exception:
-        lower_bound = None
+    # Best-known bound (Gurobi's dual bound) for gap reporting on the
+    # incumbent path.
+    lower_bound = dual if (dual is not None and dual != float("-inf")
+                           and dual == dual) else None
 
     gap = None
     if lower_bound is not None and lower_bound > 0 and obj > 0:
@@ -461,75 +592,64 @@ def solve(n, l0, w0, cmat, d_uniform, rotate, sym, time_limit):
         "pipe_cost": pipe_cost,
         "lower_bound": lower_bound,
         "gap": gap,
+        "elapsed": time.time() - t0,
         "log": log,
     }
 
 
 # ── 5. Visualization ─────────────────────────────────────────────────────────
 
-# Block fill colors are driven by "connectivity": for each block i, the sum
-# of its pipe costs to all other blocks. The central rack scenario produces
-# one strongly-connected block (block 1) plus n-1 weakly-connected blocks,
-# which the gradient surfaces clearly.
+# "Connectivity" = for each block, the sum of its incident pipe costs. No
+# longer drives the fill (blocks use their palette/badge color now), but still
+# feeds the block tooltip and the hover-to-highlight adjacency.
 def _connectivity(blocks, pairs):
+    """Per-block realized piping cost: each pipe touching a block contributes
+    its cost-weighted rectilinear distance c·(dx+dy) — the same quantity summed
+    into 'Total piping cost'. So an object shows its own pipe's cost and the
+    rack (touched by every pipe) shows the grand total. The coefficient c alone
+    isn't a cost; it ignores distance. (Preview pairs carry no dx/dy and have
+    c=0, so .get keeps them at zero.)"""
     conn = {b["i"]: 0.0 for b in blocks}
     for p in pairs:
-        conn[p["i"]] = conn.get(p["i"], 0.0) + p["c"]
-        conn[p["j"]] = conn.get(p["j"], 0.0) + p["c"]
+        cost = p["c"] * (p.get("dx", 0.0) + p.get("dy", 0.0))
+        conn[p["i"]] = conn.get(p["i"], 0.0) + cost
+        conn[p["j"]] = conn.get(p["j"], 0.0) + cost
     return conn
 
 
 def _pipe_segments(block_i, block_j):
-    """Compute the two L-shape segments routing from block i's perimeter to
-    block j's perimeter, using edge-port routing.
+    """Two-segment L whose total drawn length equals the modeled rectilinear
+    gap dx + dy: it connects the nearest edges, or runs along the shared
+    overlap mid-line on an axis where the blocks overlap (gap 0). So the pipe
+    drawn on screen is exactly as long as the pipe the objective costs. Width
+    is along x, length along y.
 
-    Routing convention:
-      1. Determine the dominant axis between block centers (|dx| vs |dy|).
-      2. Source uses the edge-midpoint port on its dominant-axis side
-         facing j; destination uses the opposite-axis-side port facing i.
-         This naturally spreads pipes around blocks (right port for pipes
-         coming from the right, top port for pipes from above, etc.).
-      3. Bend the L-shape so the first leg runs along the dominant axis
-         leaving the source port — the natural "exit" direction.
-
-    Returns a list of two segments, each as a dict with keys
-    {"x", "y", "x2", "y2"}.
+    Returns a list of two segments, each {"x", "y", "x2", "y2"}.
     """
-    cx_i = block_i["x"] + block_i["l"] / 2
-    cy_i = block_i["y"] + block_i["w"] / 2
-    cx_j = block_j["x"] + block_j["l"] / 2
-    cy_j = block_j["y"] + block_j["w"] / 2
-    dx = cx_j - cx_i
-    dy = cy_j - cy_i
+    xi, yi, wi, li = block_i["x"], block_i["y"], block_i["w"], block_i["l"]
+    xj, yj, wj, lj = block_j["x"], block_j["y"], block_j["w"], block_j["l"]
 
-    if abs(dx) >= abs(dy):
-        # Horizontal-dominant. Use right/left edge midpoints.
-        if dx >= 0:
-            src = (block_i["x"] + block_i["l"], cy_i)   # i's right edge
-            dst = (block_j["x"], cy_j)                  # j's left edge
-        else:
-            src = (block_i["x"], cy_i)                  # i's left edge
-            dst = (block_j["x"] + block_j["l"], cy_j)   # j's right edge
-        # Horizontal-first: leave source horizontally, then drop/rise.
-        bend = (dst[0], src[1])
-        return [
-            {"x": src[0], "y": src[1], "x2": bend[0], "y2": bend[1]},
-            {"x": bend[0], "y": bend[1], "x2": dst[0], "y2": dst[1]},
-        ]
-    else:
-        # Vertical-dominant. Use top/bottom edge midpoints.
-        if dy >= 0:
-            src = (cx_i, block_i["y"] + block_i["w"])   # i's top edge
-            dst = (cx_j, block_j["y"])                  # j's bottom edge
-        else:
-            src = (cx_i, block_i["y"])                  # i's bottom edge
-            dst = (cx_j, block_j["y"] + block_j["w"])   # j's top edge
-        # Vertical-first: leave source vertically, then traverse.
-        bend = (src[0], dst[1])
-        return [
-            {"x": src[0], "y": src[1], "x2": bend[0], "y2": bend[1]},
-            {"x": bend[0], "y": bend[1], "x2": dst[0], "y2": dst[1]},
-        ]
+    # Horizontal: connect the nearest x-edges, or the overlap mid-line (gap 0).
+    if xi + wi <= xj:                      # i left of j
+        src_x, dst_x = xi + wi, xj
+    elif xj + wj <= xi:                    # i right of j
+        src_x, dst_x = xi, xj + wj
+    else:                                  # x-overlap → no horizontal run
+        src_x = dst_x = (max(xi, xj) + min(xi + wi, xj + wj)) / 2
+
+    # Vertical: connect the nearest y-edges, or the overlap mid-line.
+    if yi + li <= yj:                      # i below j
+        src_y, dst_y = yi + li, yj
+    elif yj + lj <= yi:                    # i above j
+        src_y, dst_y = yi, yj + lj
+    else:                                  # y-overlap → no vertical run
+        src_y = dst_y = (max(yi, yj) + min(yi + li, yj + lj)) / 2
+
+    # L-shape: horizontal leg then vertical leg. Total length = dx + dy.
+    return [
+        {"x": src_x, "y": src_y, "x2": dst_x, "y2": src_y},
+        {"x": dst_x, "y": src_y, "x2": dst_x, "y2": dst_y},
+    ]
 
 
 def build_layout_chart(res):
@@ -542,6 +662,10 @@ def build_layout_chart(res):
       3. Block rectangles (fill = connectivity), border highlights orange
          when a pipe connecting this block is hovered
       4. Block-id labels at centers
+
+    Width is the horizontal (x) axis and length the vertical (y) axis, matching
+    the formulation — so the rack, spanning the fixed length, renders
+    vertically while the variable width grows horizontally (a wide layout).
     """
     blocks = res["blocks"]
     pairs = res["pairs"]
@@ -562,17 +686,22 @@ def build_layout_chart(res):
 
     df_blocks = pd.DataFrame([{
         "i":   b["i"],
+        "label": _block_label(b["i"]),
+        # Rack label reads top-to-bottom along its tall, thin bar; the other
+        # (roughly square) blocks keep horizontal labels.
+        "angle": 90 if int(b["i"]) == 1 else 0,
         "x":   b["x"],
         "y":   b["y"],
-        "x2":  b["x"] + b["l"],
-        "y2":  b["y"] + b["w"],
-        "cx":  b["x"] + b["l"] / 2,
-        "cy":  b["y"] + b["w"] / 2,
+        "x2":  b["x"] + b["w"],
+        "y2":  b["y"] + b["l"],
+        "cx":  b["x"] + b["w"] / 2,
+        "cy":  b["y"] + b["l"] / 2,
         "l":   b["l"],
         "w":   b["w"],
         "rotated": "yes" if b["rotated"] else "no",
         "connectivity": conn[b["i"]],
         "connected_str": "," + ",".join(str(x) for x in sorted(adj[b["i"]])) + ",",
+        "color": _PALETTE[(int(b["i"]) - 1) % len(_PALETTE)],
     } for b in blocks])
 
     # Pipe dataframe — edge-port-routed L-shapes, two segments per pair.
@@ -585,7 +714,7 @@ def build_layout_chart(res):
             if p["c"] <= 0:
                 continue
             seg_a, seg_b = _pipe_segments(blocks_by_id[p["i"]], blocks_by_id[p["j"]])
-            pair_label = f"{p['i']}—{p['j']}"
+            pair_label = f"{_block_label(p['i'])}—{_block_label(p['j'])}"
             for seg in (seg_a, seg_b):
                 pipe_rows.append({
                     **seg,
@@ -600,12 +729,26 @@ def build_layout_chart(res):
             columns=["x", "y", "x2", "y2", "c", "pair", "i_id", "j_id"]
         )
 
-    # Domain spans with padding so nothing clips at the edges.
+    # Domain spans with padding so nothing clips at the edges. Width is the
+    # horizontal (x) axis, length the vertical (y) axis.
     pad = 0.05 * max(l_f, w_f, 1.0)
-    x_dom = [-pad, l_f + pad]
-    y_dom = [-pad, w_f + pad]
+    x_dom = [-pad, w_f + pad]
+    y_dom = [-pad, l_f + pad]
 
-    df_facility = pd.DataFrame([{"x": 0, "y": 0, "x2": l_f, "y2": w_f}])
+    # Equal-aspect sizing: identical pixels-per-unit on both axes, so the
+    # layout is geometrically faithful and the integer ticks read as an even
+    # square grid. Scale to the largest size fitting within BOTH a width and a
+    # height cap — width fills the wide viz column for the usual wide-and-short
+    # layout, while the height cap stops a tall, narrow instance from blowing
+    # up vertically. A single scale factor keeps squares square.
+    _x_span = (x_dom[1] - x_dom[0]) or 1.0
+    _y_span = (y_dom[1] - y_dom[0]) or 1.0
+    _max_w_px, _max_h_px = 1050, 520
+    _scale = min(_max_w_px / _x_span, _max_h_px / _y_span)
+    _w_px = max(160, round(_x_span * _scale))
+    _h_px = max(160, round(_y_span * _scale))
+
+    df_facility = pd.DataFrame([{"x": 0, "y": 0, "x2": w_f, "y2": l_f}])
 
     # ── Linked-hover selections ───────────────────────────────────────────
     # Two parallel selections: one bound to the pipe layer (`hover`), one to
@@ -619,41 +762,42 @@ def build_layout_chart(res):
     #
     # `nearest=False` (omitted) means the cursor must be directly on the
     # mark to trigger selection. No snap-from-afar.
-    hover = alt.selection_point(
-        name="hover",
-        on="mouseover",
-        fields=["i_id", "j_id"],
-        empty=True,
-    )
+    # The block-hover selection is always present. The pipe-hover selection
+    # and its expressions exist only when there ARE pipes — otherwise the
+    # stroke expression would reference a selection that was never added,
+    # which breaks Vega rendering (the unsolved preview, or any all-zero-cost
+    # instance, hits this).
+    has_pipes = len(df_pipes) > 0
     block_hover = alt.selection_point(
-        name="block_hover",
-        on="mouseover",
-        fields=["i"],
-        empty=True,
+        name="block_hover", on="mouseover", fields=["i"], empty=True,
     )
-
-    # Pipe is bright if:
-    #   - both selections are empty (default state),         OR
-    #   - this pipe is the hovered pipe (pipe-hover match),  OR
-    #   - this pipe touches the hovered block (block-hover match).
-    pipe_opacity_expr = (
-        "(length(hover.i_id || []) === 0 && length(block_hover.i || []) === 0)"
-        " || (length(hover.i_id || []) > 0 && datum.i_id === hover.i_id[0]"
-        "     && datum.j_id === hover.j_id[0])"
-        " || (length(block_hover.i || []) > 0 && (datum.i_id === block_hover.i[0]"
-        "     || datum.j_id === block_hover.i[0]))"
-    )
-
-    # Block is highlighted if:
-    #   - it's an endpoint of the hovered pipe,              OR
-    #   - it IS the hovered block,                           OR
-    #   - it's connected to the hovered block (via adj str).
-    block_stroke_expr = (
-        "(length(hover.i_id || []) > 0 && (datum.i === hover.i_id[0]"
-        "     || datum.i === hover.j_id[0]))"
-        " || (length(block_hover.i || []) > 0 && (datum.i === block_hover.i[0]"
-        "     || indexof(datum.connected_str, ',' + toString(block_hover.i[0]) + ',') >= 0))"
-    )
+    if has_pipes:
+        hover = alt.selection_point(
+            name="hover", on="mouseover", fields=["i_id", "j_id"], empty=True,
+        )
+        # Pipe is bright if both selections empty, OR it's the hovered pipe,
+        # OR it touches the hovered block.
+        pipe_opacity_expr = (
+            "(length(hover.i_id || []) === 0 && length(block_hover.i || []) === 0)"
+            " || (length(hover.i_id || []) > 0 && datum.i_id === hover.i_id[0]"
+            "     && datum.j_id === hover.j_id[0])"
+            " || (length(block_hover.i || []) > 0 && (datum.i_id === block_hover.i[0]"
+            "     || datum.j_id === block_hover.i[0]))"
+        )
+        # Block highlighted if it's an endpoint of the hovered pipe, IS the
+        # hovered block, or is connected to it.
+        block_stroke_expr = (
+            "(length(hover.i_id || []) > 0 && (datum.i === hover.i_id[0]"
+            "     || datum.i === hover.j_id[0]))"
+            " || (length(block_hover.i || []) > 0 && (datum.i === block_hover.i[0]"
+            "     || indexof(datum.connected_str, ',' + toString(block_hover.i[0]) + ',') >= 0))"
+        )
+    else:
+        # No pipes: highlight only on direct block-hover (no pipe selection).
+        block_stroke_expr = (
+            "length(block_hover.i || []) > 0 && (datum.i === block_hover.i[0]"
+            " || indexof(datum.connected_str, ',' + toString(block_hover.i[0]) + ',') >= 0)"
+        )
 
     # ── Build the chart layers ────────────────────────────────────────────
     base = alt.Chart(df_blocks).encode(
@@ -664,8 +808,8 @@ def build_layout_chart(res):
     facility_box = alt.Chart(df_facility).mark_rect(
         fill=None, stroke="#374151", strokeWidth=1.5, strokeDash=[6, 4],
     ).encode(
-        x=alt.X("x:Q", scale=alt.Scale(domain=x_dom)),
-        y=alt.Y("y:Q", scale=alt.Scale(domain=y_dom)),
+        x=alt.X("x:Q", scale=alt.Scale(domain=x_dom), title="x"),
+        y=alt.Y("y:Q", scale=alt.Scale(domain=y_dom), title="y"),
         x2="x2:Q",
         y2="y2:Q",
     )
@@ -676,10 +820,8 @@ def build_layout_chart(res):
     # selection (which lives on the pipe layer) so a single pipe-hover
     # also lights up its endpoint blocks.
     block_rects = base.mark_rect().encode(
-        x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
-        color=alt.Color("connectivity:Q",
-                        scale=alt.Scale(scheme="blues"),
-                        legend=alt.Legend(title="Pipe connectivity")),
+        x2="x2:Q", y2="y2:Q",
+        color=alt.Color("color:N", scale=None, legend=None),
         stroke=alt.condition(
             block_stroke_expr,
             alt.value("#f59e0b"),       # orange highlight
@@ -691,20 +833,21 @@ def build_layout_chart(res):
             alt.value(1.5),
         ),
         tooltip=[
-            alt.Tooltip("i:O", title="Block"),
-            alt.Tooltip("x:Q", format=".2f", title="x (lower-left)"),
-            alt.Tooltip("y:Q", format=".2f", title="y (lower-left)"),
-            alt.Tooltip("l:Q", format=".2f", title="length"),
-            alt.Tooltip("w:Q", format=".2f", title="width"),
+            alt.Tooltip("label:N", title="Block"),
+            alt.Tooltip("x:Q", format=".0f", title="x (lower-left)"),
+            alt.Tooltip("y:Q", format=".0f", title="y (lower-left)"),
+            alt.Tooltip("l:Q", format=".0f", title="length"),
+            alt.Tooltip("w:Q", format=".0f", title="width"),
             alt.Tooltip("rotated:N", title="Rotated"),
-            alt.Tooltip("connectivity:Q", format=".2f", title="Σ pipe cost"),
+            alt.Tooltip("connectivity:Q", format=".0f", title="Piping cost"),
         ],
     ).add_params(block_hover)
 
     block_labels = alt.Chart(df_blocks).mark_text(
         fontSize=14, fontWeight="bold", color="#0a0a4e",
     ).encode(
-        x="cx:Q", y="cy:Q", text="i:O",
+        x=alt.X("cx:Q", title="x"), y=alt.Y("cy:Q", title="y"), text="label:N",
+        angle=alt.Angle("angle:Q", scale=None),   # raw degrees, no scaling
     )
 
     # Pipe overlay — two co-located layers. The visible layer is a thin
@@ -712,189 +855,429 @@ def build_layout_chart(res):
     # transparent wider rule that captures the hover event and shows the
     # tooltip. Decoupling them lets us keep pipes visually thin while
     # giving the cursor a more forgiving hit zone.
-    if len(df_pipes):
+    layers = [facility_box]
+    if has_pipes:
         visible_pipes = alt.Chart(df_pipes).mark_rule(
             stroke="#dc2626",
         ).encode(
-            x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
+            x=alt.X("x:Q", title="x"), y=alt.Y("y:Q", title="y"),
+            x2="x2:Q", y2="y2:Q",
             size=alt.Size("c:Q",
                           scale=alt.Scale(range=[0.5, 4]),
-                          legend=alt.Legend(title="Pipe cost")),
+                          legend=None),
             opacity=alt.condition(pipe_opacity_expr, alt.value(0.9), alt.value(0.25)),
         )
         pipe_hit_targets = alt.Chart(df_pipes).mark_rule(
             stroke="transparent",
             strokeWidth=8,
         ).encode(
-            x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
+            x=alt.X("x:Q", title="x"), y=alt.Y("y:Q", title="y"),
+            x2="x2:Q", y2="y2:Q",
             tooltip=[
                 alt.Tooltip("pair:N", title="Pair (i—j)"),
-                alt.Tooltip("c:Q", format=".2f", title="Pipe cost"),
+                alt.Tooltip("c:Q", format=".0f", title="Pipe cost"),
             ],
         ).add_params(hover)
-        pipe_lines = alt.layer(visible_pipes, pipe_hit_targets)
-    else:
-        pipe_lines = alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_rule()
+        layers.append(alt.layer(visible_pipes, pipe_hit_targets))
+    layers.extend([block_rects, block_labels])
+
+    # "Not Solved" badge on the initialization preview so the unsolved state
+    # reads at a glance. Fixed-pixel placement (top-centre) is independent of
+    # the data scale; the light plate keeps the label legible over the blocks.
+    if res.get("status") == "preview":
+        _one = pd.DataFrame([{"_": 0}])
+        _bx, _by = _w_px / 2.0, 24.0
+        plate = alt.Chart(_one).mark_rect(
+            fill="white", fillOpacity=0.85, stroke="#9ca3af",
+            strokeWidth=1, cornerRadius=6,
+        ).encode(
+            x=alt.value(_bx - 54), x2=alt.value(_bx + 54),
+            y=alt.value(_by - 14), y2=alt.value(_by + 14),
+        )
+        badge = alt.Chart(_one).mark_text(
+            text="Not Solved", fontSize=15, fontWeight="bold", color="#b91c1c",
+        ).encode(x=alt.value(_bx), y=alt.value(_by))
+        layers.extend([plate, badge])
 
     chart = (
-        alt.layer(facility_box, pipe_lines, block_rects, block_labels)
-        .properties(height=560)
+        alt.layer(*layers)
+        .properties(
+            width=_w_px, height=_h_px,
+            # Disable Vega-Embed's "⋮" actions menu (Save / View Source /
+            # Open in Vega Editor) — vega-embed reads embed options from the
+            # spec's usermeta. The Streamlit element toolbar (fullscreen /
+            # show-data) is hidden via CSS in render_optimizer.
+            usermeta={"embedOptions": {"actions": False}},
+        )
         .configure_view(strokeOpacity=0)
-        .configure_axis(grid=True, gridColor="#e5e7eb")
+        .configure_axis(grid=True, gridColor="#e5e7eb", tickMinStep=1)
     )
     return chart
 
 
 # ── 6. Tab renderers ─────────────────────────────────────────────────────────
 
-def render_layout(res):
-    if res is None:
-        st.info("Click **Solve Optimization** in the sidebar to compute a layout.")
-        return
+def _render_metric(slot, label, value):
+    """Metric-shaped block via raw HTML — small gray label, large value.
+    Matches strip-packing's top-row metrics so the five read consistently."""
+    slot.markdown(
+        "<div style='margin:0.25rem 0 1.3rem 0; line-height:1.2;'>"
+        "<div style='font-size:0.875rem; margin-bottom:0.6rem; "
+        f"white-space:nowrap;'>{label}</div>"
+        "<div style='font-size:1.8rem; font-weight:400; line-height:1.1; "
+        f"white-space:nowrap;'>{value}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    status = res["status"]
-    if status == "no_feasible":
-        st.error(f"Solver hit the time limit before finding any feasible solution. "
-                 "Try a smaller `n` or a smaller min-separation distance.")
-        return
-    if status == "infeasible":
-        st.error("The instance is infeasible. The min-separation distance is "
-                 "likely too large for the chosen blocks. Try smaller values.")
-        return
-    if status == "unbounded":
-        st.error("Unbounded — model definition is broken. This shouldn't happen.")
-        return
-    if status not in ("optimal", "incumbent"):
-        st.warning(f"Solver finished with status: {status}")
-        return
 
-    # Status banner.
-    obj = res["obj"]
-    l_f, w_f = res["facility"]
-    pipe_cost = res["pipe_cost"]
-    facility_size = l_f + w_f
+def _render_object_editor(ss):
+    """Inline object editor (left column of the Optimizer tab): one row per
+    object with Length / Width / pipe-cost-to-rack steppers. Object 1 is the
+    rack — fixed in the list, no pipe-cost cell, not deletable. Add / Reset /
+    Randomize below. Same fixed-slot pattern as strip-packing."""
+    st.markdown(f"#### Objects (max {MAX_OBJECTS})")
 
-    if status == "optimal":
-        st.success(
-            f"**Optimal layout found.** "
-            f"Objective = {obj:.2f}  ·  "
-            f"facility {l_f:.1f} × {w_f:.1f} = {l_f * w_f:.1f} sq.units  ·  "
-            f"pipe cost = {pipe_cost:.2f}"
+    ver = ss["_obj_ver"]
+    cols_spec = [0.5, 1.2, 1.2, 1.2, 0.6]
+
+    header = st.columns(cols_spec)
+    header[1].markdown("**Length**")
+    header[2].markdown("**Width**")
+    header[3].markdown("**Pipe cost**")
+
+    objs = ss["objs"]
+    n = len(objs)
+    changed = False
+    # Fixed slot count (constant element count avoids the delete ghost-row
+    # flash — same reasoning as strip-packing / circle-packing).
+    for slot in range(MAX_OBJECTS):
+        if slot >= n:
+            st.empty()
+            continue
+        oid = objs[slot]
+        idx = slot + 1
+        is_rack = (slot == 0)
+        color = _PALETTE[(idx - 1) % len(_PALETTE)]
+        c = st.columns(cols_spec, vertical_alignment="center")
+        # Colored badge: the rack reads "rack" (a wider pill); the others are
+        # numbered from 1. Color keys off the block index so the badge always
+        # matches that object's fill in the layout.
+        _badge_w = "padding:0 0.45rem;" if is_rack else "width:1.6rem;"
+        c[0].markdown(
+            f'<div style="display:inline-flex;align-items:center;'
+            f'justify-content:center;{_badge_w}height:1.6rem;'
+            f'border-radius:0.3rem;background:{color};color:#fff;'
+            f'font-weight:700;font-size:0.85rem;white-space:nowrap;">'
+            f'{_block_label(idx)}</div>',
+            unsafe_allow_html=True,
         )
+        new_l = c[1].number_input(
+            "Length", min_value=DIM_MIN, max_value=DIM_MAX, step=1,
+            value=int(ss["length"][oid]), key=f"len_{oid}_{ver}",
+            label_visibility="collapsed",
+        )
+        new_w = c[2].number_input(
+            "Width", min_value=DIM_MIN, max_value=DIM_MAX, step=1,
+            value=int(ss["width"][oid]), key=f"wid_{oid}_{ver}",
+            label_visibility="collapsed",
+        )
+        new_c = ss["cost"].get(oid, 0)
+        if not is_rack:               # rack has no pipe-cost cell (left blank)
+            new_c = c[3].number_input(
+                "Pipe cost", min_value=COST_MIN, max_value=COST_MAX, step=1,
+                value=int(ss["cost"][oid]), key=f"cost_{oid}_{ver}",
+                label_visibility="collapsed",
+            )
+        if not is_rack and n > MIN_OBJECTS:
+            c[4].button("🗑", key=f"del_{oid}_{ver}",
+                        on_click=_delete_object, args=(oid,))
+        if (new_l != ss["length"][oid] or new_w != ss["width"][oid]
+                or (not is_rack and new_c != ss["cost"][oid])):
+            ss["length"] = {**ss["length"], oid: new_l}
+            ss["width"] = {**ss["width"], oid: new_w}
+            if not is_rack:
+                ss["cost"] = {**ss["cost"], oid: new_c}
+            changed = True
+
+    if changed:
+        ss.pop("res", None)
+        st.rerun()
+
+    bcols = st.columns(3)
+    if bcols[0].button("➕ Add", key="add_obj",
+                       disabled=n >= MAX_OBJECTS, use_container_width=True):
+        add_object()
+        st.rerun()
+    if bcols[1].button("↺ Reset", key="reset_obj", use_container_width=True):
+        ss["_pending_reset"] = True
+        st.rerun()
+    if bcols[2].button("🎲 Randomize", key="rand_obj",
+                       use_container_width=True):
+        ss["_pending_random"] = True
+        st.rerun()
+
+
+def _preview_res(ss):
+    """Naive 'initialized' layout for the unsolved view, consistent with the
+    rack-spans-the-facility constraint: the rack sits at the origin spanning
+    the facility length (vertical y), with the other objects column-packed to
+    its right within that length. Costs are zeroed so no pipes draw. Shaped
+    like a solve result so build_layout_chart renders it directly."""
+    objs = ss["objs"]
+    n = len(objs)
+    gap = 1.0
+    rl = float(ss["length"][objs[0]])              # rack length (along y) = facility length
+    rw = float(ss["width"][objs[0]])               # rack width (along x), thin
+    # Rack on the left, spanning the length (y); objects column-packed to its
+    # right, stacking in y within the rack length and wrapping to a new column.
+    blocks = [{"i": 1, "x": 0.0, "y": 0.0, "l": rl, "w": rw, "rotated": False}]
+    x = rw + gap
+    y = 0.0
+    col_w = 0.0
+    for p in range(2, n + 1):
+        oid = objs[p - 1]
+        lp, wp = float(ss["length"][oid]), float(ss["width"][oid])
+        if y > 0.0 and y + lp > rl + 1e-9:          # column full → next column
+            y = 0.0
+            x += col_w + gap
+            col_w = 0.0
+        blocks.append({"i": p, "x": x, "y": y, "l": lp, "w": wp,
+                       "rotated": False})
+        y += lp + gap
+        col_w = max(col_w, wp)
+    pairs = [{"i": i, "j": j, "c": 0.0}
+             for i in range(1, n + 1) for j in range(1, i)]
+    return {"status": "preview", "blocks": blocks, "pairs": pairs,
+            "facility": (rl, x + col_w)}
+
+
+def _clear_solution():
+    """Drop the stored solve so the view falls back to the initialization
+    preview. Wired as the on_change for the top controls (min distance /
+    rotation / time limit): changing an option invalidates the displayed
+    layout, which was solved under the previous settings."""
+    st.session_state.pop("res", None)
+
+
+def render_optimizer(ss):
+    """Main tab: object editor on the left, layout + inline controls and
+    metrics on the right."""
+    # Editor styling matched to strip-packing / circle-packing: tighter row
+    # spacing + compact, right-aligned number fields, and click-only steppers
+    # (pointer-events:none blocks click-to-type on the <input> while the +/-
+    # buttons, separate elements, stay live).
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMainBlockContainer"]
+            [data-testid="stHorizontalBlock"] {
+            margin-bottom: -0.75rem;
+            gap: 0.5rem !important;
+        }
+        [data-testid="stMainBlockContainer"] [data-testid="stWidgetLabel"] {
+            margin-bottom: 0.25rem !important;
+        }
+        div[role="radiogroup"] {
+            gap: 0.4rem !important;
+        }
+        div[role="radiogroup"] label {
+            margin-right: 0 !important;
+        }
+        [data-testid="stNumberInputContainer"] input {
+            padding-top: 0.25rem; padding-bottom: 0.25rem;
+            text-align: right; padding-right: 0.4rem;
+            pointer-events: none;
+            user-select: none;
+            caret-color: transparent;
+        }
+        /* Cap the field width so the value sits next to the +/- buttons
+           instead of stretching across the column — compact rows, while
+           still wide enough that the steppers stay visible. */
+        [data-testid="stNumberInputContainer"] {
+            max-width: 6.5rem;
+        }
+        /* Drop the on-hover chart chrome for a clean presentation view:
+           Streamlit's element toolbar (fullscreen / show-data) and any
+           remnant of Vega-Embed's "⋮" actions menu (also disabled via the
+           chart's usermeta embedOptions in build_layout_chart). */
+        [data-testid="stElementToolbar"] {
+            display: none !important;
+        }
+        .vega-embed details,
+        .vega-embed .vega-actions {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    editor_col, viz_col = st.columns([4, 8])
+
+    with editor_col:
+        _render_object_editor(ss)
+
+    with viz_col:
+        # Everything in one row (strip-packing layout): Solve / Min distance /
+        # Rotation / Time limit, then the five metric slots. The layout paints
+        # below through a placeholder so the controls commit before we draw.
+        top = st.columns(
+            [0.7, 1.5, 1.2, 1.9, 1.0, 1.0, 1.1, 0.9, 1.0],
+            vertical_alignment="bottom",
+        )
+        with top[0]:
+            solve_clicked = st.button("Solve", type="primary",
+                                      use_container_width=True)
+        with top[1]:
+            d_min = st.number_input(
+                "Min distance", min_value=D_MIN, max_value=D_MAX, step=1,
+                value=int(ss["d_min"]), key="dmin_input",
+                on_change=_clear_solution,
+            )
+        with top[2]:
+            rotate = st.checkbox("Rotation", value=ss["rotate"],
+                                 key="rotate_box", on_change=_clear_solution)
+        with top[3]:
+            time_label = st.radio(
+                "Time limit", options=list(_TIME_LIMITS.keys()), index=0,
+                horizontal=True, key="time_radio",
+                on_change=_clear_solution,
+            )
+        facL_slot = top[4].empty()
+        facW_slot = top[5].empty()
+        pipe_slot = top[6].empty()
+        gap_slot = top[7].empty()
+        time_slot = top[8].empty()
+        # Spacer so the plot sits a little below the controls/metrics row.
+        st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+        viz_slot = st.empty()
+        spinner_slot = st.empty()
+
+    ss["d_min"] = int(d_min)
+    ss["rotate"] = bool(rotate)
+    time_limit = _TIME_LIMITS[time_label]
+
+    if solve_clicked:
+        n, l0, w0, cmat = _objs_to_inputs(ss)
+        with spinner_slot.container():
+            with st.spinner(
+                f"Running Gurobi (Big-M, time limit {time_limit}s)..."
+            ):
+                ss["res"] = solve(n, l0, w0, cmat, float(ss["d_min"]),
+                                  ss["rotate"], 1, time_limit)
+        spinner_slot.empty()
+
+    res = ss.get("res")
+
+    with viz_slot.container():
+        if res is None:
+            st.altair_chart(build_layout_chart(_preview_res(ss)),
+                            use_container_width=False)
+        elif res["status"] in ("optimal", "incumbent"):
+            st.altair_chart(build_layout_chart(res), use_container_width=False)
+        elif res["status"] == "no_feasible":
+            st.error("Hit the time limit before finding any feasible layout. "
+                     "Try fewer objects, a smaller minimum distance, or a "
+                     "longer time limit.")
+        elif res["status"] == "infeasible":
+            st.error("Infeasible — an object may be longer than the rack "
+                     "(every object must fit within the rack's length), or the "
+                     "minimum separation is too large. Try shortening objects, "
+                     "lengthening the rack, or reducing the distance.")
+        elif res["status"] == "license_busy":
+            st.error(res.get("message", "Gurobi license busy — try again."))
+        elif res["status"] == "solver_missing":
+            st.error(res.get("message", "Solver not available."))
+        else:
+            st.warning(f"Solver returned: {res['status']}")
+
+    has = res is not None and res["status"] in ("optimal", "incumbent")
+    if has:
+        l_f, w_f = res["facility"]
+        facL, facW = f"{l_f:.1f}", f"{w_f:.1f}"
+        pipe = f"{res['pipe_cost']:.2f}"
+        if res["status"] == "optimal":
+            gap = "0%"
+        elif res.get("gap") is not None:
+            gap = f"{res['gap'] * 100:.1f}%"
+        else:
+            gap = "—"
+        elapsed = res.get("elapsed")
+        tstr = f"{elapsed:.1f}s" if elapsed is not None else "—"
     else:
-        gap_str = f", gap ≈ {res['gap'] * 100:.1f}%" if res["gap"] is not None else ""
-        st.warning(
-            f"**Incumbent (suboptimal).** Solver hit the time limit. "
-            f"Best feasible objective = {obj:.2f}{gap_str}  ·  "
-            f"facility {l_f:.1f} × {w_f:.1f}  ·  "
-            f"pipe cost = {pipe_cost:.2f}"
-        )
+        facL = facW = pipe = gap = tstr = "—"
 
-    # Layout chart.
-    chart = build_layout_chart(res)
-    st.altair_chart(chart, use_container_width=True)
-
-    st.caption(
-        "Block fill = total pipe cost incident on that block. "
-        "Red lines = pipes between block centers (thicker = higher cost). "
-        "Dashed rectangle = facility bounding box."
-    )
-
-
-def render_data(ss):
-    """Editable block-dimensions table + cost matrix."""
-    st.markdown("### Block dimensions")
-    st.caption("Default length and width per block. Rotation (toggleable in "
-               "the sidebar) lets the optimizer swap these to align block "
-               "orientation with the layout.")
-
-    n = ss["n"]
-    df_dims = pd.DataFrame({
-        "Block":  list(range(1, n + 1)),
-        "l₀":     [ss["l0"][i] for i in range(1, n + 1)],
-        "w₀":     [ss["w0"][i] for i in range(1, n + 1)],
-    })
-    edited_dims = st.data_editor(
-        df_dims,
-        hide_index=True,
-        disabled=["Block"],
-        column_config={
-            "Block": st.column_config.NumberColumn(width="small"),
-            "l₀":    st.column_config.NumberColumn(min_value=0.1, format="%.2f"),
-            "w₀":    st.column_config.NumberColumn(min_value=0.1, format="%.2f"),
-        },
-        key="dims_editor",
-    )
-    # Sync edits back into session_state.
-    ss["l0"] = {int(row["Block"]): float(row["l₀"]) for _, row in edited_dims.iterrows()}
-    ss["w0"] = {int(row["Block"]): float(row["w₀"]) for _, row in edited_dims.iterrows()}
-
-    st.markdown("### Pipe cost matrix")
-    st.caption("Lower-triangular n×n matrix. `c[i, j]` is the per-unit-length "
-               "pipe cost between blocks i and j (only the strict lower "
-               "triangle, j < i, is read by the solver — upper-triangular "
-               "and diagonal cells are ignored).")
-
-    cmat = ss["cmat"]
-    df_cost = pd.DataFrame(cmat, columns=[f"j={j}" for j in range(1, n + 1)])
-    df_cost.index = [f"i={i}" for i in range(1, n + 1)]
-    edited_cost = st.data_editor(
-        df_cost,
-        column_config={
-            f"j={j}": st.column_config.NumberColumn(min_value=0.0, format="%.2f")
-            for j in range(1, n + 1)
-        },
-        key="cost_editor",
-    )
-    # Mirror back into the lower triangle (zero everything else).
-    new_cmat = [[0.0] * n for _ in range(n)]
-    for ii in range(n):
-        for jj in range(n):
-            if ii > jj:
-                v = edited_cost.iat[ii, jj]
-                new_cmat[ii][jj] = float(v) if pd.notna(v) else 0.0
-    ss["cmat"] = new_cmat
+    _render_metric(facL_slot, "Facility length", facL)
+    _render_metric(facW_slot, "Facility width", facW)
+    _render_metric(pipe_slot, "Total piping cost", pipe)
+    _render_metric(gap_slot, "Gap", gap)
+    _render_metric(time_slot, "Total time", tstr)
 
 
 def render_formulation():
     img_path = Path(__file__).parent / "images" / "formulation.png"
     if img_path.exists():
-        st.image(str(img_path),
-                 caption="Plant facility layout — block placement schematic.",
-                 use_container_width=False)
+        # Render at ~half width via a half-width column; the PNG is high-res,
+        # so it just downscales and stays crisp.
+        _img_col, _ = st.columns(2)
+        with _img_col:
+            st.image(str(img_path),
+                     caption="Plant facility layout — block placement schematic.",
+                     use_container_width=True)
 
     st.markdown(r"""
 ### Optimal control problem
 
-Place $n$ rectangular blocks in the 2-D plane so that the facility's
-bounding-box dimensions plus the cost-weighted Manhattan pipe distances
-between block centers are minimized:
+Place $n$ rectangular objects so that the facility's bounding-box
+dimensions plus the cost-weighted Manhattan pipe distances to the rack are
+minimized. Width is the horizontal ($x$) axis, length the vertical ($y$):
 
-$$\min \; l_f + w_f + \sum_{i,j \in N,\; j<i} c_{ij} \big( t_{ij} + s_{ij} \big)$$
+$$\min \; l_f + w_f + \sum_{i,j \in N,\; j<i} c_{ij} \big( dx_{ij} + dy_{ij} \big)$$
 
-subject to the facility containing every block:
+subject to the facility containing every object (length along $y$, width
+along $x$):
 
-$$l_f \ge x_i + l_i, \quad w_f \ge y_i + w_i \quad \forall \, i \in N$$
+$$l_f \ge y_i + l_i, \quad w_f \ge x_i + w_i \quad \forall \, i \in N$$
 
-worst-case position bounds $x_i, y_i \le \mathrm{UB}$ where
-$\mathrm{UB} = \sum_i \max(l_i, w_i)$, a minimum separation
-$t_{ij} \ge d_{ij}$, and the **non-overlap disjunction** (one of four
-geometric arrangements per pair) plus the **rotation disjunction**
-(default vs. 90° rotated, when rotation is enabled).
+The pipe **rack** (object 1) spans the facility length — pinned at the
+origin with the facility length fixed to the rack's, so every other object
+fits within $[0, l_1]$ and sits to either side of the rack:
+
+$$y_1 = 0, \qquad l_f = l_1$$
+
+The rectilinear edge gaps are defined by always-on constraints:
+
+$$dx_{ij} \ge x_i - (x_j + w_j), \qquad dx_{ij} \ge x_j - (x_i + w_i)$$
+$$dy_{ij} \ge y_i - (y_j + l_j), \qquad dy_{ij} \ge y_j - (y_i + l_i)$$
+
+with worst-case position bounds $x_i, y_i \le \mathrm{UB}$ where
+$\mathrm{UB} = \sum_i \max(l_i, w_i)$, plus the **non-overlap disjunction**
+(one of four geometric arrangements per pair) and the **rotation
+disjunction** (default vs. 90° rotated, when rotation is enabled; the rack
+stays fixed).
+
+Since $dx_{ij}, dy_{ij}$ are minimized and bounded below by both signed
+gaps, each settles to the true clearance (0 when the objects overlap on
+that axis). Defining them *outside* the disjunction keeps the objective
+independent of which spatial relation is chosen — the disjunction's only
+job is non-overlap.
 
 ### Disjunctions
 
-For every pair $(i, j)$ with $j < i$, one of the four arrangements must hold:
+For every pair $(i, j)$ with $j < i$, one of the four separations must
+hold, with the minimum clearance $d_{ij}$ built in:
 
 $$
-\bigvee_{k=1}^{4}
-\begin{bmatrix}
-Y_{ij}^k \\
-\text{spatial relation } k \\
-\text{Manhattan separations}
-\end{bmatrix}
-\quad \text{($k=1$ left, $2$ right, $3$ above, $4$ below)}
+\begin{bmatrix} Y_{ij}^1 \\ x_i + w_i + d_{ij} \le x_j \end{bmatrix}
+\lor
+\begin{bmatrix} Y_{ij}^2 \\ x_j + w_j + d_{ij} \le x_i \end{bmatrix}
+\lor
+\begin{bmatrix} Y_{ij}^3 \\ y_i + l_i + d_{ij} \le y_j \end{bmatrix}
+\lor
+\begin{bmatrix} Y_{ij}^4 \\ y_j + l_j + d_{ij} \le y_i \end{bmatrix}
 $$
+
+($k=1$ left, $2$ right, $3$ below, $4$ above.)
 
 When rotation is enabled, each block additionally chooses orientation:
 
@@ -909,22 +1292,24 @@ $$
 The trivial mirror symmetries make the LP relaxation eight-fold
 degenerate. We anchor block 1 to be left-of-and-below block 2's center:
 
-$$x_1 + l_1/2 \le x_2 + l_2/2 \qquad y_1 + w_1/2 \le y_2 + w_2/2$$
+$$x_1 + w_1/2 \le x_2 + w_2/2 \qquad y_1 + l_1/2 \le y_2 + l_2/2$$
 
 This kills four of eight reflective equivalences and noticeably tightens
 the LP relaxation.
 
 ### Solution method
 
-We discretize the GDP via the **multi-Big-M transformation**
-(`gdp.mbigm`), which derives a tight Big-M coefficient per constraint
-from variable bounds — much tighter than uniform Big-M. The resulting
-MILP is solved with **HiGHS**.
+We reformulate the GDP into a MILP with the **Big-M** transformation —
+one indicator per disjunct with a big constant — then solve it with
+**Gurobi**. With the single-inequality disjuncts above, Big-M keeps the
+model compact; the Hull (convex-hull) transformation was benchmarked too,
+but it disaggregates every variable per disjunct, inflating the model for
+a tighter relaxation that doesn't pay off here.
 
-For larger instances (n > 8) the MIP can exceed the wall-clock time
-limit. The app then loads the **best feasible incumbent** found before
-the cutoff and reports the optimality gap. Try smaller min-separation
-distances if the solver returns infeasible.
+For larger instances (n > 8) the MIP can exceed the wall-clock
+time limit; the app then loads the **best feasible incumbent** found
+before the cutoff and reports the optimality gap. Try smaller
+min-separation distances if the solver returns infeasible.
 
 ### References
 
@@ -933,20 +1318,18 @@ Mathematical Models for Optimal Process Plant Layout," *Industrial &
 Engineering Chemistry Research*, vol. 37, no. 9, pp. 3631–3639, 1998.
 [ACS](https://pubs.acs.org/doi/10.1021/ie980146v)
 
-[2] P. M. Castro, I. E. Grossmann, and A. Q. Novais, "Two New Continuous-Time
-Models for the Scheduling of Multistage Batch Plants with Sequence-Dependent
-Changeovers," *Computers & Chemical Engineering*, 2005.
-[ScienceDirect](https://doi.org/10.1016/j.compchemeng.2005.06.005)
+[2] J. Westerlund and L. G. Papageorgiou, "Improved Performance in
+Process Plant Layout Problems Using Symmetry-Breaking Constraints,"
+*Proc. FOCAPD 2004 (Foundations of Computer-Aided Process Design)*,
+2004.
+[PDF](https://skoge.folk.ntnu.no/prost/proceedings/focapd_2004/pdffiles/papers/075_46.pdf)
 
-[3] H. D. Sherali and J. C. Smith, "Improving discrete model
-representations via symmetry considerations," *Management Science*,
-vol. 47, no. 10, pp. 1396–1407, 2001.
+[3] N. W. Sawaya and I. E. Grossmann, "A Cutting Plane Method for
+Solving Linear Generalized Disjunctive Programming Problems,"
+*Computers & Chemical Engineering*, vol. 29, no. 9, pp. 1891–1913, 2005.
+[ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0098135405000992)
 
-[4] L. T. Biegler, *Nonlinear Programming: Concepts, Algorithms, and
-Applications to Chemical Processes*, SIAM, 2010 (background on the
-disjunctive-programming approach).
-
-[5] M. L. Bynum, G. A. Hackebeil, W. E. Hart, C. D. Laird,
+[4] M. L. Bynum, G. A. Hackebeil, W. E. Hart, C. D. Laird,
 B. L. Nicholson, J. D. Siirola, J.-P. Watson, and D. L. Woodruff,
 *Pyomo — Optimization Modeling in Python*, 3rd ed. Cham: Springer,
 2021.
@@ -956,7 +1339,7 @@ B. L. Nicholson, J. D. Siirola, J.-P. Watson, and D. L. Woodruff,
 
 def render_logs(res):
     if res is None:
-        st.info("Run a solve to see HiGHS's output.")
+        st.info("Run a solve to see Gurobi's output.")
         return
     log = res.get("log", "")
     if log.strip():
@@ -971,52 +1354,6 @@ def render_logs(res):
 _init_state()
 ss = st.session_state
 
-# ---- Sidebar controls ----
-st.sidebar.markdown(
-    "## Initial Conditions &nbsp; "
-    "<span style='color: rgba(49, 51, 63, 0.6); font-size: 0.875rem; "
-    "font-weight: 400;'>plant layout setup</span>",
-    unsafe_allow_html=True,
-)
-
-prev_n = ss["n"]
-ss["n"] = st.sidebar.slider("Number of blocks, n", N_MIN, N_MAX, ss["n"], 1, key="n_slider")
-
-prev_scenario = ss["scenario"]
-ss["scenario"] = st.sidebar.radio(
-    "Pipe network",
-    options=["Central rack", "Random pipes", "Custom"],
-    horizontal=False,
-    index=["Central rack", "Random pipes", "Custom"].index(ss["scenario"]),
-    key="scenario_radio",
-)
-
-# If n or scenario just changed, regenerate the data and clear stale results.
-if ss["n"] != prev_n or ss["scenario"] != prev_scenario:
-    if ss["scenario"] != "Custom":
-        _resync_for_n_or_scenario()
-    else:
-        # Going custom — keep the existing data, but resize if n changed.
-        _resync_for_n_or_scenario()
-    ss.pop("res", None)
-
-ss["rotate"]  = st.sidebar.checkbox("Allow rotation", value=ss["rotate"], key="rotate_box")
-ss["d_min"]   = st.sidebar.slider("Min separation distance, d", 0.0, 3.0, ss["d_min"], 0.1, key="dmin_slider")
-
-st.sidebar.button("Initialize at defaults", on_click=_initialize_at_defaults,
-                  use_container_width=True,
-                  help="Re-randomize block dimensions and pipe network (with "
-                       "a fresh seed) and clear any prior solve.")
-
-st.sidebar.header("Solver")
-time_limit = st.sidebar.slider(
-    "Solve time limit (s)",
-    TIMELIMIT_MIN, TIMELIMIT_MAX, TIMELIMIT_DEFAULT, 1, key="timelimit_slider",
-)
-
-solve_btn = st.sidebar.button("Solve Optimization", type="primary",
-                              use_container_width=True)
-
 # ---- Title ----
 st.markdown(
     "<h2 style='margin: 0 0 0.25rem 0; padding: 0; font-size: 1.5rem; font-weight: 700;'>"
@@ -1026,8 +1363,8 @@ st.markdown(
     "<a href='https://github.com/Pyomo/pyomo' target='_blank' "
     "style='color: #6b7280; text-decoration: underline;'>Pyomo</a>"
     " + "
-    "<a href='https://github.com/ERGO-Code/HiGHS' target='_blank' "
-    "style='color: #6b7280; text-decoration: underline;'>HiGHS</a>"
+    "<a href='https://www.gurobi.com' target='_blank' "
+    "style='color: #6b7280; text-decoration: underline;'>Gurobi</a>"
     "</span>"
     "</h2>",
     unsafe_allow_html=True,
@@ -1035,39 +1372,19 @@ st.markdown(
 _caption_col, _ = st.columns([6, 3])
 with _caption_col:
     st.markdown(
-        "Place rectangular blocks in 2D space to minimize the facility's "
-        "bounding-box dimensions plus cost-weighted Manhattan pipe distances "
-        "between blocks. Edit dimensions and pipe costs in the **Data** tab, "
-        "then click **Solve Optimization** in the sidebar."
+        "A pipe **rack** spans the facility; place the other objects on either "
+        "side of it to minimize the facility's **width** plus the cost-weighted "
+        "Manhattan pipe distance from each object to the rack. Edit the "
+        "objects, set the options, and click **Solve**."
     )
 
-# ---- Solve ----
-if solve_btn:
-    with st.spinner(f"Running HiGHS (time limit {time_limit}s)..."):
-        try:
-            res = solve(
-                n=ss["n"],
-                l0=ss["l0"], w0=ss["w0"],
-                cmat=ss["cmat"],
-                d_uniform=ss["d_min"],
-                rotate=ss["rotate"], sym=1,
-                time_limit=time_limit,
-            )
-        except Exception as e:
-            st.error(f"Solver error: {e}")
-            st.stop()
-    ss["res"] = res
-
 # ---- Tabs ----
-tab_layout, tab_data, tab_form, tab_logs = st.tabs(
-    ["▶  Layout", "📊  Data", "📐  Formulation", "📋  Logs"]
+tab_opt, tab_form, tab_logs = st.tabs(
+    ["▶  Optimizer", "📐  Formulation", "📋  Logs"]
 )
 
-with tab_layout:
-    render_layout(ss.get("res"))
-
-with tab_data:
-    render_data(ss)
+with tab_opt:
+    render_optimizer(ss)
 
 with tab_form:
     render_formulation()

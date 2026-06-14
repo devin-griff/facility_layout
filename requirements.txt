@@ -1,12 +1,13 @@
 # Two-tier pinning strategy:
 #
-# Tier 1 — exact pin. The Pyomo APIs we use for the time-limit incumbent
-# path (load_solutions=False; results.found_feasible_solution();
-# m.solutions.load_from(results)) have shifted across minor releases.
-# A hard pin guarantees the Fly image rebuilds with identical solver
-# behavior every time. Bump deliberately + test before deploy.
-pyomo==6.8.2
-highspy==1.14.0
+# Tier 1 — exact pin. The native appsi Gurobi APIs we use
+# (config.load_solution=False; res.best_feasible_objective;
+# res.solution_loader.load_vars()) have shifted across minor releases,
+# and the legacy appsi wrapper crashes on GDP-transformed models on
+# older Pyomo. A hard pin guarantees identical solver behavior on every
+# rebuild. Bump deliberately + test before deploy.
+pyomo==6.10.0
+gurobipy~=13.0
 #
 # Tier 2 — compatible release. Stable surface APIs at our usage level
 # (sliders, data_editor, charts), so accept patch upgrades for security
